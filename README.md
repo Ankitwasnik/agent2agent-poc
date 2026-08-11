@@ -36,41 +36,26 @@ This single-fetch model is what makes discovery cheap. There's no negotiation da
 
 ### Four ways of communication
 
-1. Synchronous
-2. Polling
-3. Server Sent Events
-4. Push notifications
+
+1. **Synchronous (request/response).** One call, one blocking wait, one final answer — no task ID, nothing to check back on later. Fits work fast and deterministic enough that waiting for it is simply fine. The agent signals this itself by enqueueing a single `Message` rather than a `Task`.
+2. **Polling.** The agent hands back a `Task` immediately (typically `SUBMITTED`), and the client periodically calls `tasks/get` until it reaches a terminal state. Fits work that takes a noticeable amount of time but doesn't need live progress — a "check back in a bit" relationship.
+3. **Server-Sent Events (streaming).** The client holds one HTTP connection open and receives `TaskStatusUpdateEvent`/`TaskArtifactUpdateEvent` updates live as the agent produces them. Fits work with genuine incremental progress worth watching happen, rather than just waiting for a final result.
+4. **Push notifications (webhook).** The client registers a callback URL up front, gets an immediate acknowledgment, and does nothing else — the agent's server POSTs updates to that URL as the task progresses. Fits long-running, human-in-the-loop-shaped work where the client shouldn't have to stay connected or keep asking. Delivery is explicitly best-effort (no retry, no guarantee), which is exactly why Section 8 insists a resilient client always pairs this with a timeout-and-fallback-to-polling.
+
+This PoC builds one agent per pattern — Flight Search (synchronous), Itinerary Planning (polling), Hotel Search (streaming), Visa/Travel-Requirements (push) — with full run instructions in `poc.md`.
 
 
 ## 4. PoC — Designing a System with A2A
-4a. Scenario
 
-- Pick a task with genuine long-running + human-in-the-loop shape (this is where A2A's value actually shows, per Section 2b) — e.g., an agent that needs approval mid-task, not just a quick lookup 
-4b. Build
+**The PoC idea:** a "Trip Planner" — not one agent that happens to support all four communication patterns, but **four independent agents, one per pattern**, each its own standalone server + client pair, its own port, no shared orchestrator. Isolating each pattern in its own agent keeps every one legible on its own, rather than burying the distinction inside branching logic in a single agent.
 
-- Stand up one A2A agent (server side) and one caller (client side), agent card, task lifecycle 
-4c. Design for SSE / long-running work
+- **Flight Search** (synchronous) — look up flights for a destination/date. Fast and deterministic enough that a blocking call is simply the right fit; no task ID needed at all.
+- **Itinerary Planning** (polling) — draft a day-by-day plan. Drafting genuinely takes a few real seconds (an LLM call plus a simulated planning delay), long enough to be worth a `Task`, not so long that live updates matter — a "check back in a bit" relationship.
+- **Hotel Search** (SSE streaming) — find hotel options one at a time. Each result is its own real unit of work with its own latency, worth watching arrive live rather than waiting silently for a final batch.
+- **Visa/Travel-Requirements** (push notifications) — check visa requirements for a nationality/destination. This is the agent that actually satisfies 4a's "long-running + human-in-the-loop" criterion directly: it stands in for a slow embassy/document review, the kind of task where a client shouldn't have to stay connected or keep asking at all.
 
-- Implement streaming updates via SSE, show a dropped-connection-and-resubscribe scenario, confirm it replays a full snapshot rather than losing state
-4d. Design for failures — and the fix for each
+Each agent uses an LLM for real query understanding and/or result generation (not canned responses) so the PoC demonstrates actual agent behavior, not just protocol plumbing wired to fixtures. Full build and run instructions in Section 6 / `poc.md`; what came out of building it is in Section 7.
 
-Failure	What A2A gives you	What you still have to build
-Stream drops mid-task	Resubscribe replays full snapshot	Your client's reconnect logic
-Webhook never arrives	It's best-effort by design	Fallback to polling
-Forged/tampered agent card	Signature verification	Your own acceptance rule (verifyAgentCard)
-Version mismatch	Loud VersionNotSupportedError	Your handling of the error, not silent misreads
-Task paused indefinitely	tasks/cancel, TaskNotCancelableError	Your own timeout policy
-Network flake	—	Client retry with backoff
-
-4e. What to measure/demo live
-
-- Kill the connection mid-stream, show resubscribe recovering full state 
-- Force a version mismatch and show the explicit error vs a silent failure 
-- Show a paused task resuming after a real time gap (not just same-session) 
-5. Conclusion
-
-- Recap: A2A's overhead each pays for something specific — card because you can't read the other side's code, context-in-request because no shared memory, server-side task because the connection won't outlive the job 
-- Restate the boundary from Section 2c: only reach for this when the agent on the other end truly isn't yours
 
 ## 6. Running the PoC
 
@@ -86,165 +71,52 @@ Some agents call an LLM and need an API key in `.env` at the repo root:
 OPENAI_API_KEY=sk-...
 ```
 
-### Flight Search Agent — synchronous request/response
+Full run instructions, expected output, and implementation notes for each of the four agents and the seven failure-mode demos live in **`poc.md`**. What follows here is what actually came out of building and testing all of it — the findings, not the how-to.
 
-Uses an LLM to parse free-form flight requests (fuzzy cities, relative dates) into a structured origin/destination/date, then looks up flights against mock data. The client sends one message and blocks until the agent has fully processed it and replies — no task ID, no polling loop, no open stream. Requires `OPENAI_API_KEY`.
+## 7. Findings From Building the PoC
 
-1. Start the server (keep running in its own terminal):
-   ```
-   uv run python -m agent2agent.flight_search.server
-   ```
-   Serves on `http://localhost:9001`.
+### The four communication patterns really are just transport choices, not different agents
 
-2. (Optional) confirm the agent card is being served:
-   ```
-   curl http://localhost:9001/.well-known/agent-card.json
-   ```
+The most concrete confirmation of Section 1's "black box" claim: the Itinerary Planning agent (polling) and the Visa/Travel-Requirements agent (push notifications) run **the exact same shape of executor code** — enqueue a `Task`, call `TaskUpdater.start_work()`, do the real work, `add_artifact()`, `complete()`. Nothing in `agent_executor.py` knows or cares whether the client is going to poll `tasks/get` or sit back and wait for a webhook. That decision is made entirely on the server's wiring (`server.py` — whether a `push_config_store`/`push_sender` are attached to the `DefaultRequestHandler`) and the client's config (`ClientConfig(polling=True)` vs. attaching a `push_notification_config`). The agent genuinely doesn't need to know which one it's going to get.
 
-3. Run the client with the default fuzzy query:
-   ```
-   uv run python -m agent2agent.flight_search.client
-   ```
-   Or with your own query — structured or free-form, both work:
-   ```
-   uv run python -m agent2agent.flight_search.client flights from BOS to MIA on 2026-10-05
-   uv run python -m agent2agent.flight_search.client need to get from the bay area to nyc sometime next month
-   ```
+The one real branch point in agent code is **Message vs. Task**: enqueueing a single `Message` (Flight Search) tells the framework "this is a one-shot, immediate answer" — no task ID, no polling, no push config even possible. Enqueueing a `Task` opts into the entire long-running lifecycle (status updates, cancellation, resumability, push eligibility) at once. That's the one structural decision an agent author actually makes; everything downstream of it (sync/polling/streaming/push) is a client-and-transport-level choice, not something the agent's own logic branches on.
 
-   Expected output:
-   ```
-   Query: need to get from the bay area to nyc sometime next month
-   Sending request, blocking until the agent responds...
+### The Agent Card is fetched once, then never travels with a request again
 
-   Flights from SFO to JFK on next month:
-     AA AA101  depart 08:00 -> arrive 16:25  ($342)
-     UA UA245  depart 13:10 -> arrive 21:35  ($289)
-   ```
+Confirmed this by reading the client code path rather than assuming it: `A2ACardResolver.get_agent_card()` does one GET to `/.well-known/agent-card.json`, and the resulting `AgentCard` is cached inside the `Client` object (`self._card`) for its whole lifetime. Every later call — `send_message`, `get_task`, `cancel_task`, `subscribe` — only sends its own method-specific JSON-RPC params; the card itself never re-appears on the wire. The only thing that *does* travel with every request is a small `A2A-Version` header. This is exactly what makes the "single-fetch discovery" pitch in Section 3 literally true, not just a nice description.
 
-   Routes with no mock data fall back to a generic flight list. If the LLM can't determine the origin, destination, or date, the agent replies asking for what's missing instead of guessing or crashing.
+### Six of the seven failure-mode demos needed zero agent changes
 
-### Itinerary Planning Agent — polling
+Version mismatch checking, `tasks/cancel`/`TaskNotCancelableError`, resubscribe-with-snapshot-replay, and best-effort push delivery are **already implemented in the a2a-sdk's request handler** — none of it is something an agent author has to write. Every failure-mode demo except `signature_demo.py` reused one of the four agents completely unmodified; only signature verification needed a dedicated (executor-less) mini server, because the whole point of that demo was to control both sides of a signing keypair. In other words: most of what the README's original failure-modes table (Section 4d) worried about turned out to be the framework's job, not the application's — the actual application-level work was almost entirely on the *client* side (timeout policies, retry loops, fallback-to-polling), which matches the table's own "what you still have to build" column.
 
-Uses an LLM to parse a free-form trip request (destination, number of days, interests), then a second LLM call to draft a day-by-day itinerary. Drafting takes a few seconds (plus a simulated planning delay), so the agent returns a `Task` immediately in `SUBMITTED` state and the client checks in periodically via `tasks/get` instead of blocking or holding a stream open. Requires `OPENAI_API_KEY`.
+### A task has two lifetimes, and mixing them up is the one real gotcha we hit
 
-1. Start the server (keep running in its own terminal):
-   ```
-   uv run python -m agent2agent.itinerary_planning.server
-   ```
-   Serves on `http://localhost:9002`.
+Testing `resubscribe_demo.py` with a longer disconnect gap surfaced a genuine two-tier lifecycle: the task *record* (`InMemoryTaskStore`, a plain dict with no expiry, effectively permanent until the server restarts) and the *live tracking* of it (`ActiveTaskRegistry`, torn down the moment a task is terminal and has no subscribers). `tasks/subscribe` depends on the second and fails once it's gone; `tasks/get` depends only on the first and always works. A client that only knows how to resubscribe, without a `tasks/get` fallback, will break on exactly this timing — which is precisely why the resilience demo needed both.
 
-2. (Optional) confirm the agent card is being served:
-   ```
-   curl http://localhost:9002/.well-known/agent-card.json
-   ```
+### Signature verification only means something with asymmetric keys and your own trust store
 
-3. Run the client with the default query:
-   ```
-   uv run python -m agent2agent.itinerary_planning.client
-   ```
-   Or with your own:
-   ```
-   uv run python -m agent2agent.itinerary_planning.client Plan a 5-day trip to Lisbon focused on history and beaches
-   ```
+The first pass at `signature_demo.py` used a shared HS256 secret, which technically worked but quietly assumed the client already had a side-channel to the agent — fine for a closed fleet, useless for verifying a random third-party agent. Switching to RS256 (private key signs, public key verifies) and adding a genuine forgery scenario (an attacker with their *own* keypair, signing a lookalike card) made the actual point land: `key_provider` is where the client's own trust decision lives, wholly separate from anything the card claims about itself. A forged card can copy any field it wants, including the `kid` — what it can never do is produce a signature that verifies under a public key it doesn't control. That's the entire mechanism, and the protocol only supplies it; deciding which keys to trust is left to the client, exactly as the original plan's "your own acceptance rule" line said it would be.
 
-   Expected output:
-   ```
-   Query: Plan a 3-day itinerary for Tokyo focused on food and temples
-   Sending request...
+### Network flakiness and webhook delivery are explicitly not the protocol's problem
 
-   Task 23bd964f-fac7-4e19-bcb6-b4493e1f6bd0 submitted, status: SUBMITTED
-     poll #1: status: WORKING
-     poll #2: status: WORKING
-     poll #3: status: WORKING
-     poll #4: status: COMPLETED
+Both `retry_demo.py` and `webhook_fallback_demo.py` confirmed something the original plan's table already stated but which is worth having actually seen: `BasePushNotificationSender` logs a warning and moves on when a webhook POST fails — it does not retry, and that failure never reaches the client. A plain `httpx.ConnectError` is never softened into anything friendlier by the SDK either. Both are squarely "bring your own resilience" by design, not oversights.
 
-   **Day 1: Explore Traditional Tokyo**
-   ...
-   ```
+## 8. What a Resilient Agent Client Should Actually Do
 
-   If the LLM can't determine the destination or trip length, the task still completes, but with a clarifying message instead of an itinerary artifact — no crash, no silent guess.
+A client only earns the label "resilient" if it goes in assuming every one of these will eventually happen: connections drop, webhooks never arrive, the agent takes longer than expected, its card gets tampered with in transit, and the network just flakes out for no reason. Section 7 covers what testing each of those individually showed us; here's what it adds up to as an actual design.
 
-### Hotel Search Agent — SSE streaming
+**1. Verify identity before you trust capability.** Don't fetch a card and act on it — fetch it, verify the signature against a public key *you already decided to trust*, and only then read `capabilities`/`supported_interfaces` to decide how to talk to the agent. Being well-formed JSON doesn't make a card self-authenticating. → `signature_demo.py`
 
-Finds hotel options one at a time — each is its own LLM call, so each result has genuine, separate latency worth streaming as it arrives. The agent keeps one SSE connection open and sends an artifact chunk (hotel name + per-night price) as each option is found, rather than returning everything at once. Defaults to 3 options; the LLM parser picks up an explicit count from the request itself (e.g. "find me 5 hotels"), capped at 10 to keep the demo bounded. Requires `OPENAI_API_KEY`.
+**2. Know what you got back before you assume you can watch it.** A `Message` response is final — no task ID, nothing to poll, stream, or cancel. Only a `Task` response gives you an ID worth holding onto. Branch on which one you got; don't assume every reply is pollable. → Flight Search (Message) vs. the other three agents (Task)
 
-1. Start the server (keep running in its own terminal):
-   ```
-   uv run python -m agent2agent.hotel_search.server
-   ```
-   Serves on `http://localhost:9003`.
+**3. Persist the task ID the moment you have it — it's the only thing guaranteed to survive a crash.** Everything else — the httpx client, in-memory state, the process itself — can disappear without losing anything, as long as the task ID was written down somewhere durable. A client that only keeps task state in memory has, by construction, no resilience story for its own crashes. → `submit_then_detach.py` + `check_later.py`
 
-2. (Optional) confirm the agent card is being served (note `"streaming": true`):
-   ```
-   curl http://localhost:9003/.well-known/agent-card.json
-   ```
+**4. Layer your "watch this task" strategy: stream → resubscribe → `tasks/get`, in that order, all the way down.** Streaming gives the richest live view; if the connection drops, resubscribing gets you back with a full snapshot instead of a gap; if the task already finished and got evicted from active tracking before you resubscribed, `tasks/get` is the fallback that always works because it doesn't depend on live tracking at all. A client that only implements the first rung breaks the moment reality doesn't cooperate. → `resubscribe_demo.py`
 
-3. Run the client with the default query:
-   ```
-   uv run python -m agent2agent.hotel_search.client
-   ```
-   Or with your own, optionally naming how many options you want:
-   ```
-   uv run python -m agent2agent.hotel_search.client Find 5 hotels in Paris for 2 guests, checking in 2026-10-01 and checking out 2026-10-05
-   ```
+**5. Treat push notifications as an optimization, never a guarantee.** Delivery is explicitly best-effort — the server logs a failed POST and moves on, nothing more. Pair every webhook registration with a timeout and a polling fallback; "wait forever for the callback" isn't a resilience strategy, it's a hang waiting to happen. → `webhook_fallback_demo.py`
 
-   Expected output (each line prints live as the agent streams it, not all at once):
-   ```
-   Query: Find hotels in Tokyo for 2 guests, checking in 2026-09-10 and checking out 2026-09-14
-   Opening SSE stream...
+**6. Decide your own timeout, and expect canceling an already-finished task to fail loudly, not silently.** A2A gives you `tasks/cancel` and `TaskNotCancelableError`; it has no opinion on how long is too long. Pick a budget, cancel when it's blown, and treat `TaskNotCancelableError` on a second attempt as confirmation the first cancel worked — not a bug. → `cancel_demo.py`
 
-   [task]     a30c51a1-9909-44cc-84e0-582bedcfbe32 — status: SUBMITTED
-   [status]   WORKING
-   [status]   WORKING: Searching for hotels in Tokyo...
-   [artifact]   Shinjuku Grand Hotel — $150/night
-   [artifact]   Tokyo Sunshine Inn — $120/night
-   [artifact]   Tokyo Urban Lodge — $130/night
-   [status]   COMPLETED
-   ```
+**7. Only retry what's actually retriable — a version mismatch isn't.** Distinguish transport-level failures (`A2AClientError`, connection errors — worth backing off and retrying) from protocol-level ones (`VersionNotSupportedError`, `InvalidParamsError` — retrying changes nothing; they need a code fix or a different agent). A retry loop that can't tell these apart just burns time re-sending a request that will fail identically every time. → `retry_demo.py`, `version_mismatch_demo.py`
 
-   If the LLM can't determine the destination, check-in, or check-out date, the task still completes, but with a clarifying message instead of hotel results.
-
-### Visa/Travel-Requirements Agent — push notifications (webhook)
-
-Checks visa/entry requirements for a nationality + destination — standing in for a slow, human-in-the-loop process (an embassy/document review). Too long to poll for or hold a stream open across, so the client registers a webhook URL when it sends the request, gets an immediate acknowledgement, and then does nothing but wait: the agent's server calls back to the client's own tiny local HTTP endpoint as the task progresses. Requires `OPENAI_API_KEY`. The client runs its own webhook listener on port 8004, so make sure that port is free.
-
-1. Start the server (keep running in its own terminal):
-   ```
-   uv run python -m agent2agent.visa_requirements.server
-   ```
-   Serves on `http://localhost:9004`.
-
-2. (Optional) confirm the agent card is being served (note `"pushNotifications": true`):
-   ```
-   curl http://localhost:9004/.well-known/agent-card.json
-   ```
-
-3. Run the client with the default query:
-   ```
-   uv run python -m agent2agent.visa_requirements.client
-   ```
-   Or with your own:
-   ```
-   uv run python -m agent2agent.visa_requirements.client Do I need a visa? I am a UK citizen traveling to Brazil.
-   ```
-
-   Expected output:
-   ```
-   Query: Do I need a visa? I am a US citizen traveling to Vietnam.
-   Registering webhook: http://localhost:8004/webhook
-   Sending request...
-
-   [webhook] task — status: SUBMITTED
-   Task e4a976ff-3e42-494e-be06-3071bd7fb9a3 submitted, status: SUBMITTED
-   Waiting for push notifications (no polling loop, no open stream held by this client)...
-
-   [webhook] status: WORKING
-   [webhook] status: WORKING: Checking visa requirements for a US citizen traveling to Vietnam...
-   [webhook] artifact:
-   As a US citizen traveling to Vietnam, you will need a visa to enter the country...
-
-   (Simulated for this demo — verify with official sources before travel.)
-   [webhook] status: COMPLETED
-   ```
-
-   Every line prefixed `[webhook]` arrived via the agent POSTing to the client's local listener, not through the original request or any polling call. If the LLM can't determine the nationality or destination, the task still completes — pushed the same way — with a clarifying message instead of a requirements summary.
+**8. Watch for retry-triggered duplicate work — a gap our own demo doesn't close.** `retry_demo.py`'s simulated flake fails at the transport layer, before any bytes reach the server, so retrying there is free — the agent never saw the earlier attempts. Real flakes aren't always that polite: if a request reaches the server and starts a task, but it's the *response* that gets lost, blindly retrying with a freshly-generated message risks spinning up a second, redundant task. A production-grade client would reuse the same message/task ID across retries of the same logical request, so a server that already started the work recognizes it instead of doing it twice — worth flagging plainly as a real risk, since nothing in this PoC actually exercises it.
