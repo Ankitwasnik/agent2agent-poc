@@ -146,3 +146,73 @@ Nothing else moves. Not the `AgentExecutor`, not the routes, not one client scri
 **One more layer worth naming here, because it's easy to conflate with the task store and it very much isn't the same thing: `ActiveTaskRegistry`.** This is the SDK's *live* bookkeeping — the background producer/consumer pair actually driving a task while something is running or watching it. Unlike the task store, this one absolutely does clean up after itself: the moment a task reaches a terminal state and has zero subscribers, its `ActiveTask` entry is torn down. That's the right lifetime for something whose only job is coordinating live work — but it's exactly why `resubscribe_demo.py` can fail if you wait too long before reconnecting: the task itself finished and its live tracking got cleaned up before the client tried to `tasks/subscribe` back to it. `tasks/get`, reading straight from the task store, doesn't care — it never depended on that live tracking existing in the first place. Two layers, two very different lifetimes, and the failure mode that falls out of confusing them is one this PoC actually hit while testing, not a hypothetical.
 
 **The practical takeaway:** `InMemoryTaskStore` for local development, demos, and anything single-process and disposable — genuinely the right default there, not a shortcut to feel bad about. Reach for `DatabaseTaskStore` (or a custom `TaskStore` implementation — it's just an interface) the moment any of three things become true: tasks need to survive a restart, more than one server process is running, or "how long do we keep task history" needs to be an actual product decision instead of "however long the process happens to stay up."
+
+## 10. Authentication & Authorization: What A2A Actually Gives You (and What It Doesn't)
+
+Worth saying plainly up front: none of the four travel agents in this PoC implement authentication — everything below started as SDK-source analysis, not something demoed. A dedicated fifth demo (`auth_demo.py`, below) since closed that gap. The shape of what's there — and, more instructively, what's conspicuously *not* there — fits the exact pattern the rest of this PoC kept running into: the protocol declares the contract and gives you a place to plug in the real logic. It doesn't supply the real logic itself.
+
+**The Agent Card declares required auth — declaring is all it does.** `security_schemes` is a named map of scheme definitions covering the same five families OpenAPI's `securitySchemes` does: API key, HTTP auth (Bearer, etc.), OAuth2, OpenID Connect, mutual TLS. `security_requirements` says which of those are actually required — at the whole-agent level on `AgentCard`, or narrowed to a single skill on `AgentSkill`. A card can legitimately say "OAuth2 for everything except the `search-flights` skill, which only needs an API key." That's useful discovery information for a client deciding how to authenticate, and nothing more. Publishing it doesn't make the server check anything.
+
+**The client has a ready-made interceptor for attaching credentials — but not for sourcing them.** `AuthInterceptor` reads whatever the fetched card declared and, for each required scheme, asks a `CredentialService` for a credential; if it gets one, it attaches it correctly — `Authorization: Bearer <token>` for HTTP-Bearer, OAuth2, and OpenID Connect alike (all three are treated as implicitly Bearer), or a named header for an API-key-in-header scheme. The source is upfront that API keys in a query string or cookie aren't handled — header-only. `CredentialService` itself is abstract; the one shipped implementation, `InMemoryContextCredentialStore`, is an explicitly toy, session-keyed dict. Real credential sourcing — refreshing an OAuth token, reading a secrets manager — is entirely your own code behind that interface.
+
+**The server verifies nothing itself; it adapts to whatever ASGI auth middleware you install.** This is the detail worth sitting with the longest. `ServerCallContext.user` defaults to `UnauthenticatedUser()`, and `DefaultServerCallContextBuilder.build_user()` makes the dependency explicit:
+
+```python
+def build_user(self, request: Request) -> User:
+    if 'user' in request.scope:
+        return StarletteUser(request.user)
+    return UnauthenticatedUser()
+```
+
+`request.scope['user']` only exists if Starlette's own `AuthenticationMiddleware` — with a real `AuthenticationBackend` that actually validates a bearer token, an API key, a client cert — is installed in front of the A2A routes. None of the four agents in this PoC do that, so concretely: every one of them treats every caller as the same anonymous user today, no matter what headers arrive. There is no A2A-specific credential check anywhere in the request handler; it's a pass-through to the standard ASGI pattern.
+
+**Task isolation is already there, dormant, waiting for a real user to show up.** `OwnerResolver` (default: `resolve_user_scope`, which just reads `context.user.user_name`) is what keys `InMemoryTaskStore` and `InMemoryPushNotificationConfigStore` — owner first, then task ID. Wire up real authentication and this starts working immediately: one caller's `tasks/list` won't surface another's tasks. It's a genuine authorization primitive sitting one middleware away from mattering, not something that needs to be built from scratch.
+
+**Two mechanisms worth not confusing with any of the above:**
+- **Agent Card signatures** (`signature_demo.py` elsewhere in this PoC) authenticate the *card*, not the caller — proving it wasn't forged or tampered with in transit. An orthogonal direction entirely.
+- **Extended Agent Card** (`AgentCapabilities.extended_agent_card`, the `GetExtendedAgentCard` method) lets an agent publish a minimal card for anonymous discovery and a richer one — more skills, more detail — only to callers who've already authenticated. A legitimate "don't leak your full surface to anonymous probing" pattern, built on the same auth plumbing above.
+
+**Push notifications get a third, distinct direction of auth: the agent proving itself to the client.** `TaskPushNotificationConfig.token` is a shared secret the client picks when registering a webhook; the agent echoes it back as an `X-A2A-Notification-Token` header on every push POST, so the client's webhook can confirm a given push actually came from the agent it registered with. The same config also has an `authentication: AuthenticationInfo` field for a more general scheme-plus-credentials pair — but tracing `BasePushNotificationSender._dispatch_notification` directly shows it only ever reads `token`; `authentication` is declared in the schema without a visible consumer in the reference sender.
+
+**The pattern holds one more time.** Same shape as signature verification's "your own acceptance rule," version mismatch's "your own handling," retry's "your own backoff": A2A supplies the vocabulary (`security_schemes`) and the plug points (an interceptor slot client-side, a `user` slot server-side, owner-scoped storage underneath) — never the credential-checking logic itself, on either end.
+
+### Try it yourself: the Auth Demo Agent
+
+A fifth agent, its own standalone server + client pair under `src/agent2agent/auth_demo/` — port 9102, same shape as the four travel agents in Section 6 — that requires a per-user API key, built to prove both halves of this section at once:
+
+- **Authentication is real, not just declared.** The agent's card advertises `apiKeyAuth` as required, but that declaration does nothing on its own — enforcement is `ApiKeyAuthBackend` (`server.py`), an entirely ordinary Starlette `AuthenticationBackend` bolted on as middleware, checking an `X-API-Key` header against a small known set of keys. The one deliberate exception: the agent-card route itself stays open to anonymous requests, because Section 3's "single-fetch discovery" claim only holds if a client can fetch the card *before* it has any credentials to present.
+- **The client never manually sets a header.** `client.py`'s `AuthInterceptor` reads the fetched card's declared scheme and asks a `CredentialService` (`InMemoryContextCredentialStore`, pre-loaded per simulated user) for a credential, then attaches it correctly on its own.
+- **Authorization is `InMemoryTaskStore`'s owner-scoping, doing exactly what Section 9 said it would once a real user shows up** — no extra code for it in this demo at all.
+
+1. Start the server (keep running in its own terminal):
+   ```
+   uv run python -m agent2agent.auth_demo.server
+   ```
+   Serves on `http://localhost:9102`.
+
+2. Run the client:
+   ```
+   uv run python -m agent2agent.auth_demo.client
+   ```
+
+   Four calls, each as a different caller — no key, a wrong key, then two valid, distinct users:
+
+```
+Agent requires: ['apiKeyAuth'] (fetched anonymously — the card itself needs no key)
+
+--- Anonymous (no API key) ---
+  send_message REJECTED: HTTP Error 401: Client error '401 Unauthorized' for url 'http://localhost:9102/'
+
+--- Invalid API key ---
+  send_message REJECTED: HTTP Error 401: Client error '401 Unauthorized' for url 'http://localhost:9102/'
+
+--- Alice (valid key) ---
+  send_message -> Hello, alice! You said: 'hello'
+  tasks/list  -> 1 task(s) visible to this caller
+
+--- Bob (valid key) ---
+  send_message -> Hello, bob! You said: 'hello'
+  tasks/list  -> 1 task(s) visible to this caller
+```
+
+The isolation proof is in that last pair: Bob's `tasks/list` shows exactly one task — his own — not two. If `OwnerResolver` weren't scoping storage by authenticated user, Bob would see Alice's task sitting right there next to his.
